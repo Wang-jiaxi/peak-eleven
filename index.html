@@ -4163,7 +4163,7 @@ function wireEvents(){
   document.querySelectorAll('#pool-list .prow').forEach(el=>{
     el.onclick = ()=> poolPick(el.dataset.id);
   });
-  document.querySelectorAll('.tab-btn').forEach(el=>{
+  document.querySelectorAll('.tab-btn[data-tab]').forEach(el=>{
     el.onclick = ()=>{ S.draftTab = el.dataset.tab; S.searchQuery=''; render(); };
   });
   if(b('player-search')){
