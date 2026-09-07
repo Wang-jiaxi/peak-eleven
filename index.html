@@ -2040,9 +2040,9 @@ function finishHandoffAndKickoff(){
 function handoffScreen(){
   return `
   <div class="panel">
-    <h2>🔄 交接给玩家二</h2>
-    <div class="sub">玩家一已经准备完毕。请把设备交给玩家二，由玩家二${S.mode==='shared'?'安排阵型、设置战术':'建队并设置战术'}。</div>
-    <div style="margin-top:16px;"><button class="primary" id="btn-handoff-continue">玩家二，开始 →</button></div>
+    <h2>🔄 交接给 ${sideLabel('ai')}</h2>
+    <div class="sub">${sideLabel('user')}已经准备完毕。请把设备交给${sideLabel('ai')}，由${sideLabel('ai')}${S.mode==='shared'?'安排阵型、设置战术':'建队并设置战术'}。</div>
+    <div style="margin-top:16px;"><button class="primary" id="btn-handoff-continue">${sideLabel('ai')}，开始 →</button></div>
   </div>`;
 }
 
@@ -2091,16 +2091,18 @@ function draftScreen(){
   ).sort((a,b)=> b.ovr-a.ovr);
 
   let subLine;
+  const uName = S.opponentType==='friend' ? sideLabel('user') : '你';
+  const aName = S.opponentType==='friend' ? sideLabel('ai') : 'AI';
   if(S.mode==='shared'){
-    subLine = `蛇形选秀 · 轮到 <b style="color:${S.turn==='user'?'var(--amber)':'var(--dim)'}">${S.turn==='user'?'你':'AI'}</b> 选人 · 你已选 ${S.userSquad.length}/16 · AI 已选 ${S.aiSquad.length}/16 —— 每选一人会自动放进阵型里最合适的空位，你也可以随时手动调整。`;
+    subLine = `蛇形选秀 · 轮到 <b style="color:${S.turn==='user'?'var(--amber)':'var(--dim)'}">${S.turn==='user'?uName:aName}</b> 选人 · ${uName}已选 ${S.userSquad.length}/16 · ${aName}已选 ${S.aiSquad.length}/16 —— 每选一人会自动放进阵型里最合适的空位，你也可以随时手动调整。`;
   } else if(S.mode==='separate'){
-    subLine = `你拥有一份独立的 ${SEPARATE_POOL_SIZE} 人卡池，AI 也已从它自己的独立卡池中组好了阵容（互不干扰）。你已选 ${S.userSquad.length}/16。`;
+    subLine = `你拥有一份独立的 ${SEPARATE_POOL_SIZE} 人卡池，${aName === 'AI' ? 'AI 也已从它自己的独立卡池中组好了阵容（互不干扰）' : `${aName} 的阵容等你选完后通过交接界面组队`}。你已选 ${S.userSquad.length}/16。`;
   } else if(S.mode==='free'){
     subLine = S.opponentType==='friend'
       ? `不限卡池，直接从全部球员数据库中自由挑选。你已选 ${S.userSquad.length}/16。`
       : `不限卡池，直接从全部球员数据库中自由挑选。AI 已自动组建了一套强力阵容——两边允许选到同一个真实球员，所以不展示 AI 的具体名单。你已选 ${S.userSquad.length}/16。`;
   } else if(S.mode==='budget'){
-    subLine = `预算选秀 · 轮到 <b style="color:${S.turn==='user'?'var(--amber)':'var(--dim)'}">${S.turn==='user'?'你':'AI'}</b> 选人 · 你已选 ${S.userSquad.length}/6（剩余预算 ${S.userBudgetLeft}M）· AI 已选 ${S.aiSquad.length}/6（剩余预算 ${S.aiBudgetLeft}M）—— 只有买得起才能选中一名球员，价格已经标在每张卡片右上角。`;
+    subLine = `预算选秀 · 轮到 <b style="color:${S.turn==='user'?'var(--amber)':'var(--dim)'}">${S.turn==='user'?uName:aName}</b> 选人 · ${uName}已选 ${S.userSquad.length}/6（剩余预算 ${S.userBudgetLeft}M）· ${aName}已选 ${S.aiSquad.length}/6（剩余预算 ${S.aiBudgetLeft}M）—— 只有买得起才能选中一名球员，价格已经标在每张卡片右上角。`;
   } else {
     const cup = S.legendaryCup;
     const activeTeam = cup.teams[cup.draftOrder[cup.draftPos]];
@@ -2390,9 +2392,9 @@ function tacticsScreen(){
   }
   const friendBanner = (S.opponentType==='friend' && S.mode!=='cup') ? `
     <div class="chip" style="font-size:13px;padding:8px 14px;margin-bottom:14px;">
-      🧑‍🤝‍🧑 好友对战 · 当前操作：${S.handoff ? '玩家二' : '玩家一'}
+      🧑‍🤝‍🧑 好友对战 · 当前操作：${sideLabel(S.handoff ? 'ai' : 'user')}
     </div>` : '';
-  if(S.opponentType==='friend' && S.mode!=='cup' && !S.handoff) kickoffLabel = '确认，交接给玩家二 →';
+  if(S.opponentType==='friend' && S.mode!=='cup' && !S.handoff) kickoffLabel = `确认，交接给${sideLabel('ai')} →`;
   let showInstantSim = false;
   if(S.mode==='cup' && S.legendaryCup && S.legendaryCup.phase==='fixtures'){
     const cup = S.legendaryCup;
@@ -2857,7 +2859,7 @@ function promptPenaltyDirection(role, callback){
   if(S.opponentType==='friend'){
     const shooterIsUser = pen.side==='user';
     const isP1 = role==='shooter' ? shooterIsUser : !shooterIsUser;
-    whoText = (isP1 ? '玩家一' : '玩家二') + '，';
+    whoText = sideLabel(isP1 ? 'user' : 'ai') + '，';
   }
   div.innerHTML = `
   <div class="modal">
