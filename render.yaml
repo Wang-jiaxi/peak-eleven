@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: peak-eleven
+    runtime: static
+    plan: free
+    branch: main
+    autoDeploy: true
+    buildCommand: echo "no build required"
+    staticPublishPath: ./
+    headers:
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache, no-store, must-revalidate
