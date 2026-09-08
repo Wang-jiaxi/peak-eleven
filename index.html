@@ -1609,6 +1609,7 @@ let S = {
   pendingHumanCount:1,
   pendingCupType:'club',
   roomCode:'', roomAction:'host', roomJoinInput:'', roomContext:null,
+  net:null, // 见 freshNet()：联机会话身份（连接/角色/名字），恢复存档时重置
   pendingAiTeams:[],
   pendingPlayerNames:[], customNames:{user:'', ai:''}, pendingCupPlayerNames:[],
   poolRefreshUsed:false,
@@ -1640,6 +1641,7 @@ const SCREEN_LABEL = {
 function saveGame(){
   try{
     if(S.screen==='menu' || S.screen==='vs-poster' || S.screen==='match') return;
+    if(S.net && S.net.role) return; // 联机对局不做本地存档：房主恢复存档也救不回已断线的房间
     localStorage.setItem(SAVE_KEY, JSON.stringify(S));
   }catch(e){ /* localStorage 不可用（隐私模式等）时静默跳过 */ }
 }
@@ -1675,6 +1677,7 @@ function restoreSave(){
   const sv = loadSave();
   if(!sv) return;
   S = sv;
+  S.net = freshNet();
   rebindRestoredState();
   // 恢复时如果轮到本地 AI 选人，补一个延迟触发（原 setTimeout 已丢失）
   if(S.screen==='draft' && S.turn==='ai' && S.opponentType==='ai'){
@@ -1684,11 +1687,298 @@ function restoreSave(){
   render();
 }
 
+/* ================= 联机房间号：真实 WebSocket 联机层 =================
+   架构（房主权威）：
+   - 中继服务器（server.js，单独部署）只转发消息，不懂足球。
+   - 房主的浏览器跑完整的游戏引擎（就是原单机引擎，未改动）。
+   - 访客浏览器不跑游戏逻辑：把自己的点击/输入转发给房主，
+     再把房主广播回来的完整游戏状态原样渲染。
+     这样两端永远一致，不会出现"两边算出不同结果"。
+   - 决策弹窗（点球/单刀/任意球/战术犯规/中场调整）由房主在状态里
+     标注当前该谁决策（netDecider=网络玩家编号），访客若是决策人，
+     就把等价弹窗渲染进自己的界面，点击经中继转发回房主的弹窗按钮。 */
+const WS_URL = 'wss://peak-eleven-relay.onrender.com';
+
+function freshNet(){
+  return {ws:null, role:null, joinError:'', myName:'', myTeamIndex:0, capacity:2, peerNames:[], connectedCount:0};
+}
+S.net = freshNet();
+
+function wsEnsureConnected(onOpen){
+  if(S.net.ws && S.net.ws.readyState===WebSocket.OPEN){ onOpen&&onOpen(); return; }
+  if(S.net.ws) { try{ S.net.ws.close(); }catch(e){} }
+  const ws = new WebSocket(WS_URL);
+  S.net.ws = ws;
+  ws.onopen = ()=>{ onOpen&&onOpen(); };
+  ws.onmessage = (ev)=>{ let msg; try{ msg=JSON.parse(ev.data); }catch(e){ return; } handleNetMessage(msg); };
+  ws.onclose = ()=>{ if(S.net.role){ S.net.connectedCount=0; S.net.joinError='连接已断开，请重新创建/加入房间。'; render(); } };
+  ws.onerror = ()=>{};
+}
+function netCreateRoom(capacity){
+  S.net.joinError='';
+  S.net.capacity = capacity||2;
+  wsEnsureConnected(()=>{ S.net.ws.send(JSON.stringify({type:'create-room', capacity:S.net.capacity})); });
+}
+function netJoinRoom(code, name){
+  S.net.joinError='';
+  wsEnsureConnected(()=>{ S.net.ws.send(JSON.stringify({type:'join-room', code:(code||'').toUpperCase().trim(), name})); });
+}
+function handleNetMessage(msg){
+  if(msg.type==='room-created'){
+    S.roomCode = msg.code; S.net.role='host'; S.net.myTeamIndex=0; S.net.capacity=msg.capacity; render();
+  } else if(msg.type==='joined'){
+    S.roomCode = msg.code; S.net.role='guest'; S.net.myTeamIndex=msg.playerIndex; S.net.capacity=msg.capacity; render();
+  } else if(msg.type==='join-failed'){
+    S.net.joinError = msg.reason==='room-full' ? '这个房间人数已经满了。' : '找不到这个房间号，检查一下是否输入正确。';
+    render();
+  } else if(msg.type==='peer-joined'){
+    S.net.connectedCount++;
+    S.net.peerNames[msg.playerIndex] = msg.name || ('玩家'+CN_NUM[msg.playerIndex+1]);
+    if(S.net.capacity===2) S.customNames.ai = msg.name; // 好友 1v1：对方名字直接进 customNames
+    render();
+  } else if(msg.type==='peer-left'){
+    S.net.connectedCount = Math.max(0, S.net.connectedCount-1);
+    S.net.peerNames[msg.playerIndex] = null;
+    render();
+  } else if(msg.type==='host-left'){
+    S.net.joinError = '房主已断开连接，请重新创建/加入房间。';
+    S.net.role = null; S.roomCode = '';
+    render();
+  } else if(msg.type==='game-state'){
+    applyRemoteState(msg.payload);
+  } else if(msg.type==='guest-action'){
+    handleGuestAction(msg.action);
+  }
+}
+// 房主每次界面变化都广播完整状态；这里做 120ms 尾沿节流，
+// 把搜索框逐字输入等高频重渲染合并成一次发送。
+let netBroadcastTimer = null;
+function broadcastState(){
+  if(!S.net || S.net.role!=='host' || !S.net.ws || S.net.ws.readyState!==WebSocket.OPEN || S.net.connectedCount===0) return;
+  if(netBroadcastTimer) return;
+  netBroadcastTimer = setTimeout(()=>{
+    netBroadcastTimer = null;
+    if(S.net && S.net.role==='host' && S.net.ws && S.net.ws.readyState===WebSocket.OPEN && S.net.connectedCount>0){
+      S.net.ws.send(JSON.stringify({type:'game-state', payload:S}));
+    }
+  }, 120);
+}
+function applyRemoteState(payload){
+  const myNet = S.net; // 联机身份是本地私有的，绝不接受房主状态里的副本
+  if(payload.net){ // 但房间成员名单/容量采用房主的，保证显示一致
+    if(payload.net.capacity) myNet.capacity = payload.net.capacity;
+    if(payload.net.peerNames) myNet.peerNames = payload.net.peerNames;
+  }
+  Object.keys(S).forEach(k=>{ delete S[k]; });
+  Object.assign(S, payload);
+  S.net = myNet;
+  render();
+}
+
+/* 把场上某一侧（user/ai）映射到网络玩家编号：
+   好友 1v1 → user=0(房主)/ai=1(访客)；杯赛 → 对应 human 队伍的 index；
+   该侧是 AI 队或没有对局时返回 -1（房主兜底为 0）。 */
+function netIndexOfSide(side){
+  if(S.mode==='cup' && S.legendaryCup){
+    const cup = S.legendaryCup;
+    const fx = cup.fixtures.find(f=>f.id===cup.currentFixture);
+    if(fx){
+      const t = cup.teams[side==='user'?fx.home:fx.away];
+      if(t && t.type==='human') return t.index;
+      return -1;
+    }
+    return -1;
+  }
+  return side==='user' ? 0 : 1;
+}
+// 弹窗决策人：优先主侧的网络编号，主侧是 AI 队时退到对侧的人类。
+function deciderForSide(side, fallbackSide){
+  let d = netIndexOfSide(side);
+  if(d<0 && fallbackSide) d = netIndexOfSide(fallbackSide);
+  return d<0 ? 0 : d;
+}
+
+/* 访客端：把 #app 上的每次点击/输入转发给房主，而不是本地执行任何游戏逻辑。
+   选择器刻意用通用形式（id、或 标签+类+dataset、或 radio），这样房主能在
+   自己"渲染得一模一样"的 DOM 里找到对应元素。 */
+function describeElement(el){
+  if(el.id) return {by:'id', v:el.id};
+  if(el.type==='radio') return {by:'radio', name:el.name, value:el.value};
+  const ds = {}; for(const k in el.dataset) ds[k]=el.dataset[k];
+  return {by:'data', tag:el.tagName, cls:(el.className||'').trim(), ds};
+}
+function locateElement(sel){
+  if(sel.by==='id') return document.getElementById(sel.v);
+  if(sel.by==='radio') return document.querySelector(`input[name="${sel.name}"][value="${sel.value}"]`);
+  const clsSel = sel.cls ? '.'+sel.cls.split(/\s+/).join('.') : '';
+  const candidates = document.querySelectorAll(sel.tag + clsSel);
+  return Array.from(candidates).find(c=> Object.keys(sel.ds).every(k=> c.dataset[k]===sel.ds[k]));
+}
+function sendGuestAction(action){
+  if(S.net.ws && S.net.ws.readyState===WebSocket.OPEN) S.net.ws.send(JSON.stringify({type:'guest-action', action}));
+}
+function wireGuestInputForwarding(){
+  const app = $('#app');
+  app.onclick = (e)=>{
+    const el = e.target.closest('button,[data-id],[data-n],[data-tab],[data-slot],[data-type],[data-label],[data-opp],[data-mode],[data-idx],[data-name],[data-dir],[data-c],.prow,.tab-btn');
+    if(!el || el.disabled) return;
+    // 访客在"等待房主开始"界面点返回：这是访客自己的本地操作，
+    // 直接退出房间，不能转发（否则会误触发房主退出）。
+    if(el.id==='btn-room-back' && S.screen==='room-code'){
+      if(S.net.ws){ try{ S.net.ws.close(); }catch(err){} }
+      S.net = freshNet();
+      S.roomCode = ''; S.roomJoinInput = '';
+      S.screen = 'menu';
+      render();
+      return;
+    }
+    e.preventDefault();
+    sendGuestAction({kind:'click', sel:describeElement(el)});
+  };
+  app.oninput = (e)=>{
+    const el = e.target;
+    if(el.tagName==='INPUT' || el.tagName==='TEXTAREA'){
+      sendGuestAction({kind:'input', sel:describeElement(el), value:el.value});
+    }
+  };
+  app.onchange = (e)=>{
+    const el = e.target;
+    if(el.tagName==='SELECT' || el.type==='radio'){
+      sendGuestAction({kind:'change', sel:describeElement(el), value:el.value});
+    }
+  };
+}
+function handleGuestAction(action){
+  const el = locateElement(action.sel);
+  if(!el) return;
+  if(action.kind==='click'){
+    if(typeof el.onclick==='function') el.onclick(); else el.click();
+  } else if(action.kind==='input'){
+    el.value = action.value;
+    if(typeof el.oninput==='function') el.oninput({target:el});
+  } else if(action.kind==='change'){
+    el.value = action.value;
+    if(el.type==='radio') el.checked = true;
+    if(typeof el.onchange==='function') el.onchange({target:el});
+  }
+}
+
+/* 访客端弹窗：房主状态里标注了当前决策人（netDecider），若轮到本访客，
+   就把与房主弹窗按钮同 class/data 的等价弹窗渲染进界面——点击后经
+   locateElement 转发回房主弹窗上的同名按钮。 */
+function guestPendingModalHTML(){
+  const m = S.match;
+  if(!m || S.screen!=='match') return '';
+  const me = S.net.myTeamIndex;
+  const wrap = (title, sub, prompt, buttons) => `
+  <div class="modal-back" style="display:flex;">
+  <div class="modal">
+    <h3>${title}</h3>
+    <div class="sub">${sub}</div>
+    <div class="pmeta" style="margin:12px 0 8px;">轮到你操作：${prompt}</div>
+    <div class="row" style="justify-content:center;gap:10px;">
+      ${buttons.map(([k,v])=>`<button class="${k.cls}" data-${k.attr}="${k.v}" style="flex:1;">${v}</button>`).join('')}
+    </div>
+  </div></div>`;
+  if(m.pendingPenalty){
+    const pr = m.pendingPenalty;
+    const prompt = pr.prompt || {role:'shooter'};
+    const decider = pr.prompt && pr.prompt.decider!=null ? pr.prompt.decider : deciderForSide(prompt.role==='shooter'?pr.side:pr.oppSide, prompt.role==='shooter'?pr.oppSide:pr.side);
+    if(decider===me){
+      const shooterSideName = sideLabel(pr.side);
+      return wrap('🥅 点球大战', `${pr.shooter.name} 主罚 vs 门将 ${pr.gk?pr.gk.name:'—'}`,
+        prompt.role==='shooter' ? `${shooterSideName}主罚，选择射门方向` : `你是门将，选择扑救方向`,
+        [['left','左路 ⬅️'],['mid','中路 ⬆️'],['right','右路 ➡️']].map(([d,t])=>[{cls:'pen-dir', attr:'dir', v:d}, t]));
+    }
+    return '';
+  }
+  if(m.pendingOneOnOne){
+    const ctx = m.pendingOneOnOne;
+    if(deciderForSide(ctx.oppSide, ctx.side)===me){
+      return wrap('⚠️ 单刀球！', `${ctx.shooter.name} 单刀杀入，你是门将 ${ctx.gk?ctx.gk.name:'—'}`,
+        '选择应对方式',
+        [[{cls:'special-choice', attr:'c', v:'advance'}, '🏃 出击'], [{cls:'special-choice', attr:'c', v:'hold'}, '🧍 不动，稳住位置']]);
+    }
+    return '';
+  }
+  if(m.pendingFreeKick){
+    const fk = m.pendingFreeKick;
+    if(deciderForSide(fk.side, fk.oppSide)===me){
+      return wrap('🎯 任意球机会！', `位置极佳，${fk.taker.name}准备主罚`, '选择战术',
+        [[{cls:'special-choice', attr:'c', v:'direct'}, '🎯 直接打门'], [{cls:'special-choice', attr:'c', v:'setplay'}, '🔀 战术配合']]);
+    }
+    return '';
+  }
+  if(m.pendingTacticalFoul){
+    const tf = m.pendingTacticalFoul;
+    if(deciderForSide(tf.oppSide, tf.side)===me){
+      return wrap('🛑 快攻时刻', `${sideLabel(tf.side)}快速反击，是否战术犯规？`, '选择防守方式',
+        [[{cls:'special-choice', attr:'c', v:'foul'}, '🛑 战术犯规'], [{cls:'special-choice', attr:'c', v:'allow'}, '🏃 正常防守']]);
+    }
+    return '';
+  }
+  if(m.pendingAdjust){
+    const adj = m.pendingAdjust;
+    if(deciderForSide(adj.side, adj.side==='user'?'ai':'user')===me){
+      const isAi = adj.side==='ai';
+      const teamTactics = isAi ? m.aiTactics : m.tactics;
+      const xi = isAi ? m.aiXi : m.xi;
+      const bench = isAi ? m.aiBench : m.userBench;
+      return `
+      <div class="modal-back" style="display:flex;">
+      <div class="modal">
+        <h3>${sideLabel(adj.side)} · ${adj.kind==='halftime'?'中场休息（不消耗调整次数）':'临场暂停调整'}</h3>
+        <div class="sub">当前比分 ${m.score.user} : ${m.score.ai} · ${fmtClock(m.clockSec)}</div>
+        <div style="margin:12px 0;">
+          <label class="pmeta">进攻方式</label>
+          <select id="adj-attack" style="width:100%;margin-top:4px;">
+            ${Object.entries(ATTACK_TACTICS).map(([k,v])=>`<option value="${k}" ${teamTactics.attack===k?'selected':''}>${v.label}</option>`).join('')}
+          </select>
+        </div>
+        <div style="margin:12px 0;">
+          <label class="pmeta">防守策略</label>
+          <select id="adj-defense" style="width:100%;margin-top:4px;">
+            ${Object.entries(DEFENSE_TACTICS).map(([k,v])=>`<option value="${k}" ${teamTactics.defense===k?'selected':''}>${v.label}</option>`).join('')}
+          </select>
+        </div>
+        <div style="margin:12px 0;">
+          <label class="pmeta">战术核心</label>
+          <select id="adj-core" style="width:100%;margin-top:4px;">
+            <option value="">— 无 —</option>
+            ${xi.filter(p=>!p.gk).map(p=>`<option value="${p.id}" ${teamTactics.coreId===p.id?'selected':''}>${p.name}</option>`).join('')}
+          </select>
+        </div>
+        <div style="margin:12px 0;">
+          <label class="pmeta">换人（可多项，${bench.length}人可换）</label>
+          ${xi.map((p,idx)=>`
+          <div class="pitch-slot">
+            <div class="slot-pos">${p.pos}</div>
+            <div style="flex:1;font-size:13px;">${p.name}<span class="pmeta"> 体能 ${Math.round(m.stamina[p.id]!=null?m.stamina[p.id]:100)}</span></div>
+            <select data-outidx="${idx}" class="sub-select">
+              <option value="">— 不换 —</option>
+              ${bench.map(b=>`<option value="${b.id}">${b.name}（${b.pos}, ${b.ovr}）</option>`).join('')}
+            </select>
+          </div>`).join('') || '<div class="sub">替补席已空</div>'}
+        </div>
+        <button class="primary" id="btn-apply-adjust" style="width:100%;">确认，${adj.kind==='halftime'?'继续下半场':'恢复比赛'}</button>
+      </div></div>`;
+    }
+    return '';
+  }
+  return '';
+}
+
 function render(){
   const app = $('#app');
   app.innerHTML = topbar() + screenHTML();
-  wireEvents();
-  saveGame();
+  if(S.net && S.net.role==='guest' && S.roomCode){
+    app.insertAdjacentHTML('beforeend', guestPendingModalHTML());
+    wireGuestInputForwarding();
+  } else {
+    wireEvents();
+    saveGame();
+  }
+  if(S.net && S.net.role==='host') broadcastState();
 }
 
 function topbar(){
@@ -1766,46 +2056,66 @@ function menuScreen(){
       </div>
     </div>
   </div>
-  <div class="footnote">球员数值为演示用途、基于历史巅峰印象简化评定，非官方评分。<br>「好友对战」通过输入同一个房间码加入同一场对局——当前版本的房间码匹配仍是预留界面，尚未接入真实的联网服务器。</div>
+  <div class="footnote">球员数值为演示用途、基于历史巅峰印象简化评定，非官方评分。<br>「好友对战」通过输入同一个房间码跨设备加入同一场对局（2-4 人的杯赛同样是跨设备真联机）。</div>
   `;
 }
 
-function generateRoomCode(){
-  return Math.random().toString(36).slice(2,8).toUpperCase();
-}
 function roomCodeScreen(){
   const isHost = S.roomAction !== 'join';
   const ctx = S.roomContext || {};
-  const nameCount = ctx.kind==='cup' ? (ctx.humanCount||1) : 2;
-  const defaultNames = ctx.kind==='cup'
-    ? Array.from({length:nameCount}, (_,i)=>'玩家'+CN_NUM[i+1])
-    : ['玩家一','玩家二'];
-  const names = S.pendingPlayerNames && S.pendingPlayerNames.length===nameCount ? S.pendingPlayerNames : defaultNames.slice();
-  S.pendingPlayerNames = names;
-  return `
-  <div class="panel">
-    <h2>🌐 好友联机 · 房间</h2>
-    <div class="footnote" style="text-align:left;margin:0 0 14px;">⚠️ 这是预留界面：当前版本还没有接入真实的联网匹配服务器，先把创建/加入房间的 UI 和交互跑通，方便以后直接换上真实的联网逻辑。现在点击下方按钮会直接进入本地同设备热座对战流程。</div>
-    <div class="row" style="gap:6px;margin-bottom:14px;">
-      <button class="tab-btn ${isHost?'active':''}" id="btn-room-host">创建房间</button>
-      <button class="tab-btn ${!isHost?'active':''}" id="btn-room-join">加入房间</button>
-    </div>
-    ${isHost ? `
+  const capacity = ctx.kind==='cup' ? (ctx.humanCount||1) : 2;
+  if(!S.roomCode){
+    return `
+    <div class="panel">
+      <h2>🌐 好友联机 · 房间</h2>
+      ${S.net.joinError ? `<div class="footnote" style="color:var(--red);text-align:left;">⚠️ ${S.net.joinError}</div>` : ''}
+      ${capacity>2 ? `<div class="pmeta" style="margin-bottom:10px;">这是一间 ${capacity} 人房——房主创建房间后，其余 ${capacity-1} 人依次输入同一个房间号加入。</div>` : ''}
+      <div class="row" style="gap:6px;margin-bottom:14px;">
+        <button class="tab-btn ${isHost?'active':''}" id="btn-room-host">创建房间</button>
+        <button class="tab-btn ${!isHost?'active':''}" id="btn-room-join">加入房间</button>
+      </div>
+      <div class="sub" style="margin-bottom:8px;">你的名字（会显示在比赛、战术、赛后报告里）：</div>
+      <input type="text" id="my-name-input" placeholder="${isHost?'玩家一':'玩家'}" value="${S.net.myName}" style="width:100%;margin-bottom:14px;box-sizing:border-box;">
+      ${isHost ? `
+        <button class="primary" id="btn-do-create-room">创建房间 →</button>
+      ` : `
+        <div class="sub" style="margin-bottom:8px;">输入朋友分享给你的房间号：</div>
+        <input type="text" id="room-join-input" placeholder="输入房间号" value="${S.roomJoinInput||''}" style="width:100%;margin-bottom:14px;box-sizing:border-box;text-align:center;font-family:var(--font-head);font-size:20px;letter-spacing:4px;text-transform:uppercase;">
+        <button class="primary" id="btn-do-join-room">加入房间 →</button>
+      `}
+      <div style="margin-top:12px;"><button class="ghost" id="btn-room-back">← 返回</button></div>
+    </div>`;
+  }
+  const roster = Array.from({length:S.net.capacity||capacity}, (_,i)=>{
+    if(i===0) return {label: S.net.role==='host' ? (S.net.myName||'玩家一') : '房主', joined:true, isMe: S.net.role==='host'};
+    const name = S.net.peerNames[i];
+    const isMe = S.net.role==='guest' && S.net.myTeamIndex===i;
+    return {label: name || (isMe ? (S.net.myName||'我') : `等待玩家${CN_NUM[i+1]}加入…`), joined: !!name || isMe, isMe};
+  });
+  const allJoined = roster.every(r=>r.joined);
+  if(S.net.role==='host'){
+    return `
+    <div class="panel">
+      <h2>🌐 好友联机 · 房间</h2>
       <div class="sub" style="margin-bottom:8px;">把这个房间号分享给你的朋友：</div>
       <div class="panel" style="background:var(--panel-alt);text-align:center;padding:24px;">
         <div style="font-family:var(--font-head);font-size:36px;letter-spacing:6px;color:var(--amber);">${S.roomCode}</div>
       </div>
-      <div class="pmeta" style="margin-top:8px;">等待朋友加入……（占位，暂不会真正联网等待）</div>
-    ` : `
-      <div class="sub" style="margin-bottom:8px;">输入朋友分享给你的房间号：</div>
-      <input type="text" id="room-join-input" placeholder="输入房间号" value="${S.roomJoinInput||''}" style="width:100%;box-sizing:border-box;text-align:center;font-family:var(--font-head);font-size:20px;letter-spacing:4px;">
-    `}
-    <div class="sub" style="margin-top:16px;margin-bottom:8px;">给每位玩家起个名字（会显示在比赛、战术、赛后报告里）：</div>
-    ${names.map((n,i)=>`<input type="text" class="player-name-input" data-idx="${i}" placeholder="${defaultNames[i]}" value="${n}" style="width:100%;margin-bottom:8px;box-sizing:border-box;">`).join('')}
-    <div style="margin-top:12px;display:flex;gap:10px;">
-      <button class="ghost" id="btn-room-back">← 返回</button>
-      <button class="primary" id="btn-room-continue">${isHost?'房间已就绪，进入选人 →':'加入并进入选人 →'}</button>
-    </div>
+      <div class="sub" style="margin:14px 0 6px;">房间成员（${roster.filter(r=>r.joined).length}/${roster.length}）</div>
+      ${roster.map(r=>`<div class="pmeta" style="margin-bottom:4px;">${r.joined?'✅':'⏳'} ${r.label}${r.isMe?'（你）':''}</div>`).join('')}
+      <div style="margin-top:16px;display:flex;gap:10px;">
+        <button class="ghost" id="btn-room-back">← 返回</button>
+        <button class="primary" id="btn-room-continue" ${allJoined?'':'disabled'}>开始游戏 →</button>
+      </div>
+    </div>`;
+  }
+  return `
+  <div class="panel">
+    <h2>🌐 好友联机 · 房间</h2>
+    <div class="sub">已加入房间 <b style="color:var(--amber);">${S.roomCode}</b>，等待房主开始游戏……</div>
+    <div class="sub" style="margin:14px 0 6px;">房间成员（${roster.filter(r=>r.joined).length}/${roster.length}）</div>
+    ${roster.map(r=>`<div class="pmeta" style="margin-bottom:4px;">${r.joined?'✅':'⏳'} ${r.label}${r.isMe?'（你）':''}</div>`).join('')}
+    <div style="margin-top:16px;"><button class="ghost" id="btn-room-back">← 返回</button></div>
   </div>`;
 }
 
@@ -1826,7 +2136,7 @@ function opponentSelectScreen(){
         <button class="primary opp-btn" data-opp="friend">开始</button>
       </div>
     </div>
-    <div class="footnote" style="margin-top:14px;">提醒：房间码联机目前是预留界面，双方暂时还是需要共用同一台设备轮流操作，等接入真实服务器后就能各自用自己的设备输入房间码联机。</div>
+    <div class="footnote" style="margin-top:14px;">提醒：房间码联机需要能连上联机服务器才能跨设备游玩；如果连不上，请确认这个页面用的是已经接好联机服务器的版本。</div>
     <div style="margin-top:10px;"><button class="ghost" id="btn-back-menu">← 返回选择模式</button></div>
   </div>`;
 }
@@ -2861,6 +3171,9 @@ function promptPenaltyDirection(role, callback){
     const isP1 = role==='shooter' ? shooterIsUser : !shooterIsUser;
     whoText = sideLabel(isP1 ? 'user' : 'ai') + '，';
   }
+  // 记录当前弹窗轮到谁决策并广播，访客端据此渲染等价的弹窗
+  pen.prompt = {role, decider: deciderForSide(role==='shooter'?pen.side:pen.oppSide, role==='shooter'?pen.oppSide:pen.side)};
+  broadcastState();
   div.innerHTML = `
   <div class="modal">
     <h3>🥅 点球大战</h3>
@@ -3758,6 +4071,9 @@ function showAdjustModal(kind, side){
   const xi = isAi ? S.match.aiXi : S.match.xi;
   const bench = isAi ? S.match.aiBench : S.match.userBench;
   const whoPrefix = S.opponentType==='friend' ? `${sideLabel(side)} · ` : '';
+  // 记录当前调整弹窗轮到哪一侧并广播，访客端据此渲染等价弹窗
+  S.match.pendingAdjust = {kind, side};
+  broadcastState();
   div.innerHTML = `
   <div class="modal">
     <h3>${whoPrefix}${kind==='halftime' ? '中场休息（不消耗调整次数）' : '临场暂停调整'}</h3>
@@ -3819,6 +4135,7 @@ function showAdjustModal(kind, side){
 
     if(kind==='timeout' && !isAi) S.match.timeoutsLeft--;
     div.remove();
+    S.match.pendingAdjust = null;
 
     if(kind==='halftime' && S.opponentType==='friend' && !isAi){
       // player 1 done — hand the same halftime adjustment to player 2 before resuming
@@ -4055,10 +4372,10 @@ function wireEvents(){
       const opp = el.dataset.opp;
       if(opp==='friend'){
         S.roomContext = {kind:'friend', mode:S.pendingMode};
-        S.roomCode = generateRoomCode();
+        S.roomCode = '';
         S.roomAction = 'host';
         S.roomJoinInput = '';
-        S.pendingPlayerNames = [];
+        S.net = freshNet();
         S.screen = 'room-code';
       } else if(S.pendingMode==='budget'){
         startBudgetMode('ai');
@@ -4077,10 +4394,10 @@ function wireEvents(){
     S.pendingAiTeams = [];
     if(n>1){
       S.roomContext = {kind:'cup', humanCount:n, cupType:type};
-      S.roomCode = generateRoomCode();
+      S.roomCode = '';
       S.roomAction = 'host';
       S.roomJoinInput = '';
-      S.pendingPlayerNames = [];
+      S.net = freshNet();
       S.screen = 'room-code';
     } else {
       S.pendingCupPlayerNames = [];
@@ -4108,26 +4425,39 @@ function wireEvents(){
     startLegendaryCup(S.pendingHumanCount||1, S.pendingCupType||'club', S.pendingAiTeams, S.pendingCupPlayerNames);
     render();
   };
-  if(b('btn-room-host')) b('btn-room-host').onclick = ()=>{ S.roomAction='host'; if(!S.roomCode) S.roomCode=generateRoomCode(); render(); };
+  if(b('btn-room-host')) b('btn-room-host').onclick = ()=>{ S.roomAction='host'; render(); };
   if(b('btn-room-join')) b('btn-room-join').onclick = ()=>{ S.roomAction='join'; render(); };
   if(b('room-join-input')) b('room-join-input').oninput = (e)=>{ S.roomJoinInput = e.target.value; };
-  document.querySelectorAll('.player-name-input').forEach(el=>{
-    el.oninput = (e)=>{ S.pendingPlayerNames[Number(el.dataset.idx)] = e.target.value; };
-  });
+  if(b('my-name-input')) b('my-name-input').oninput = (e)=>{ S.net.myName = e.target.value; };
+  if(b('btn-do-create-room')) b('btn-do-create-room').onclick = ()=>{
+    S.customNames.user = (S.net.myName||'').trim();
+    const ctx = S.roomContext;
+    const capacity = ctx && ctx.kind==='cup' ? (ctx.humanCount||1) : 2;
+    netCreateRoom(capacity);
+  };
+  if(b('btn-do-join-room')) b('btn-do-join-room').onclick = ()=>{
+    netJoinRoom(S.roomJoinInput, S.net.myName);
+  };
   if(b('btn-room-back')) b('btn-room-back').onclick = ()=>{
     const ctx = S.roomContext;
+    if(S.net.ws){ try{ S.net.ws.close(); }catch(e){} }
+    S.net = freshNet();
+    S.roomCode = '';
     S.screen = (ctx && ctx.kind==='cup') ? 'cup-setup' : 'opponent-select';
     render();
   };
   if(b('btn-room-continue')) b('btn-room-continue').onclick = ()=>{
+    // 仅房主可用：访客界面上该按钮始终 disabled/不存在，访客只等房主的第一次状态广播。
     const ctx = S.roomContext;
-    if(!ctx) return;
-    const names = (S.pendingPlayerNames||[]).map(n=>(n||'').trim());
+    if(!ctx || S.net.role!=='host') return;
     if(ctx.kind==='friend'){
-      S.customNames = {user: names[0]||'', ai: names[1]||''};
+      S.customNames.user = (S.net.myName||'').trim();
       if(ctx.mode==='budget') startBudgetMode('friend');
       else startDraftMode(ctx.mode, 'friend');
     } else if(ctx.kind==='cup'){
+      const humanCount = ctx.humanCount||1;
+      const names = [S.customNames.user];
+      for(let i=1;i<humanCount;i++) names.push(S.net.peerNames[i]||'');
       S.pendingCupPlayerNames = names;
       S.pendingAiTeams=[]; S.screen = 'cup-ai-select';
     }
@@ -4233,7 +4563,14 @@ function wireEvents(){
     S.screen='report'; render();
   };
 
-  if(b('btn-again')) b('btn-again').onclick = ()=>{ clearSave(); S.screen='menu'; S={...S, screen:'menu'}; render(); };
+  if(b('btn-again')) b('btn-again').onclick = ()=>{
+    clearSave();
+    if(S.net.ws){ try{ S.net.ws.close(); }catch(e){} }
+    S.net = freshNet();
+    S.roomCode = '';
+    S.screen='menu'; S={...S, screen:'menu'};
+    render();
+  };
   if(b('btn-menu')) b('btn-menu').onclick = ()=>{ clearSave(); location.reload(); };
   if(b('btn-cup-continue')) b('btn-cup-continue').onclick = ()=>{
     advanceCupFixtures();

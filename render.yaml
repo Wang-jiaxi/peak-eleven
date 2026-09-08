@@ -1,4 +1,14 @@
 services:
+  # 联机中继服务器：WebSocket 房间码转发（房主权威架构，跑在 Node 上）
+  - type: web
+    name: peak-eleven-relay
+    runtime: node
+    plan: free
+    branch: main
+    autoDeploy: true
+    buildCommand: npm install
+    startCommand: npm start
+  # 游戏本体：单文件静态站点
   - type: web
     name: peak-eleven
     runtime: static
